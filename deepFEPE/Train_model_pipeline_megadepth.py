@@ -27,12 +27,16 @@ import dsac_tools.utils_misc as utils_misc  # If cannot find: export KITTI_UTILS
 from train_good_utils import (
     get_all_loss,
     val_rt,
+    val_rt_notsym,
     get_all_loss_DeepF,
+    get_all_loss_DeepF_notsym,
     write_metrics_summary,
     # adjust_learning_rate,
     get_Rt_loss,
+    get_Rt_loss_notsym,
     mean_list,
     get_matches_from_SP,
+    get_matches_from_SP_withsize
 )
 
 from pebble import ProcessPool
@@ -75,20 +79,219 @@ def save_model(
     )
     logging.info("save model at training step: %d", n_iter)
 
+import math
+import cv2
+import deepFEPE.dsac_tools.utils_misc as utils_misc
+
+def get_virt_x1x2_grid_torch(sz1, sz2):
+    step = 0.1
+    # Create a meshgrid in PyTorch
+    xx, yy = torch.meshgrid(torch.arange(0, 1, step), torch.arange(0, 1, step), indexing='xy')
+    # Stack and scale coordinates as done in NumPy, but using PyTorch operations
+    sz1 = sz1.float()
+    sz2 = sz2.float()
+    # print("sz shapes: ", sz1.shape, sz2.shape, flush=True)
+    pts1_virt_b = torch.stack(((sz1[:,[0]]@xx.flatten().view(1, -1)).squeeze(1), (sz1[:,[1]]@yy.flatten().view(1, -1)).squeeze(1)), dim=-1).float() # B * N * 2
+    # pts1_virt_b = torch.permute(pts1_virt_b, [1, 2, 0])
+    pts2_virt_b = torch.stack(((sz2[:,[0]]@xx.flatten().view(1, -1)).squeeze(1), (sz2[:,[1]]@yy.flatten().view(1, -1)).squeeze(1)), dim=-1).float() # B * N * 2
+    # pts2_virt_b = torch.permute(pts2_virt_b, [1, 2, 0])
+    # print("pts1_virt_b firsts: ", pts1_virt_b[0], flush=True)
+    return pts1_virt_b, pts2_virt_b
+
+def homo_np(x):
+    # input: x [N, D]
+    # output: x_homo [N, D+1]
+    N = x.shape[0]
+    x_homo = np.hstack((x, np.ones((N, 1), dtype=x.dtype)))
+    return x_homo
+
+def get_virt_x1x2_np(F_gt, pts1_virt_b, pts2_virt_b): ##  [RUI] TODO!!!!! Convert into seq loader!
+    ## s.t. SHOULD BE ALL ZEROS: losses = utils_F.compute_epi_residual(pts1_virt_ori, pts2_virt_ori, F_gts, loss_params['clamp_at'])
+    ## Reproject by minimizing distance to groundtruth epipolar lines
+    pts1_virt, pts2_virt = cv2.correctMatches(F_gt, np.expand_dims(pts2_virt_b, 0), np.expand_dims(pts1_virt_b, 0))
+    pts1_virt[np.isnan(pts1_virt)] = 0.
+    pts2_virt[np.isnan(pts2_virt)] = 0.
+
+    pts1_virt = homo_np(pts1_virt[0])
+    pts2_virt = homo_np(pts2_virt[0])
+
+    # pts1_virt = homo_np(pts1_virt_b)
+    # pts2_virt = homo_np(pts2_virt_b)
+    return pts1_virt, pts2_virt
+
+def rotation_matrix_to_quaternion(rotation_matrix, eps=1e-6):
+    """Convert 3x4 rotation matrix to 4d quaternion vector
+
+    This algorithm is based on algorithm described in
+    https://github.com/KieranWynn/pyquaternion/blob/master/pyquaternion/quaternion.py#L201
+
+    Args:
+        rotation_matrix (Tensor): the rotation matrix to convert.
+
+    Return:
+        Tensor: the rotation in quaternion
+
+    Shape:
+        - Input: :math:`(N, 3, 4)`
+        - Output: :math:`(N, 4)`
+
+    Example:
+        >>> input = torch.rand(4, 3, 4)  # Nx3x4
+        >>> output = tgm.rotation_matrix_to_quaternion(input)  # Nx4
+    """
+    if not torch.is_tensor(rotation_matrix):
+        raise TypeError("Input type is not a torch.Tensor. Got {}".format(
+            type(rotation_matrix)))
+
+    if len(rotation_matrix.shape) > 3:
+        raise ValueError(
+            "Input size must be a three dimensional tensor. Got {}".format(
+                rotation_matrix.shape))
+    if not rotation_matrix.shape[-2:] == (3, 4):
+        raise ValueError(
+            "Input size must be a N x 3 x 4  tensor. Got {}".format(
+                rotation_matrix.shape))
+
+    rmat_t = torch.transpose(rotation_matrix, 1, 2)
+
+    mask_d2 = rmat_t[:, 2, 2] < eps
+
+    mask_d0_d1 = rmat_t[:, 0, 0] > rmat_t[:, 1, 1]
+    mask_d0_nd1 = rmat_t[:, 0, 0] < -rmat_t[:, 1, 1]
+
+    t0 = 1 + rmat_t[:, 0, 0] - rmat_t[:, 1, 1] - rmat_t[:, 2, 2]
+    q0 = torch.stack([rmat_t[:, 1, 2] - rmat_t[:, 2, 1],
+                      t0, rmat_t[:, 0, 1] + rmat_t[:, 1, 0],
+                      rmat_t[:, 2, 0] + rmat_t[:, 0, 2]], -1)
+    t0_rep = t0.repeat(4, 1).t()
+
+    t1 = 1 - rmat_t[:, 0, 0] + rmat_t[:, 1, 1] - rmat_t[:, 2, 2]
+    q1 = torch.stack([rmat_t[:, 2, 0] - rmat_t[:, 0, 2],
+                      rmat_t[:, 0, 1] + rmat_t[:, 1, 0],
+                      t1, rmat_t[:, 1, 2] + rmat_t[:, 2, 1]], -1)
+    t1_rep = t1.repeat(4, 1).t()
+
+    t2 = 1 - rmat_t[:, 0, 0] - rmat_t[:, 1, 1] + rmat_t[:, 2, 2]
+    q2 = torch.stack([rmat_t[:, 0, 1] - rmat_t[:, 1, 0],
+                      rmat_t[:, 2, 0] + rmat_t[:, 0, 2],
+                      rmat_t[:, 1, 2] + rmat_t[:, 2, 1], t2], -1)
+    t2_rep = t2.repeat(4, 1).t()
+
+    t3 = 1 + rmat_t[:, 0, 0] + rmat_t[:, 1, 1] + rmat_t[:, 2, 2]
+    q3 = torch.stack([t3, rmat_t[:, 1, 2] - rmat_t[:, 2, 1],
+                      rmat_t[:, 2, 0] - rmat_t[:, 0, 2],
+                      rmat_t[:, 0, 1] - rmat_t[:, 1, 0]], -1)
+    t3_rep = t3.repeat(4, 1).t()
+
+    mask_c0 = mask_d2 * mask_d0_d1
+    mask_c1 = mask_d2 * ~mask_d0_d1
+    mask_c2 = ~mask_d2 * mask_d0_nd1
+    mask_c3 = ~mask_d2 * ~mask_d0_nd1
+    mask_c0 = mask_c0.view(-1, 1).type_as(q0)
+    mask_c1 = mask_c1.view(-1, 1).type_as(q1)
+    mask_c2 = mask_c2.view(-1, 1).type_as(q2)
+    mask_c3 = mask_c3.view(-1, 1).type_as(q3)
+
+    q = q0 * mask_c0 + q1 * mask_c1 + q2 * mask_c2 + q3 * mask_c3
+    q /= torch.sqrt(t0_rep * mask_c0 + t1_rep * mask_c1 +  # noqa
+                    t2_rep * mask_c2 + t3_rep * mask_c3)  # noqa
+    q *= 0.5
+    return q
+
+def dataprocess(data):
+    ret = {
+        'imgs': [data['view0']['image'], data['view1']['image']],
+        'matches_all': None,
+        'matches_good': None,
+        'matches_good_unique_nums': None,
+        'get_flags': {'have_matches': torch.tensor([True]*data['view0']['image'].shape[0])}
+    }
+    # data['T_0to1'] = data['T_0to1'].inv()
+    ret['imgs_grey'] = []
+    for idx, image in enumerate(ret['imgs']):
+        if image.shape[1] == 3:  # RGB
+            scale = image.new_tensor([0.299, 0.587, 0.114]).view(1, 3, 1, 1) # B, 3, H, W
+            ret['imgs_grey'].append((image * scale).sum(1, keepdim=False)) # B, H, W
+        else:
+            ret['imgs_grey'].append(ret['imgs'][idx].clone().squeeze(1)) # B, H, W
+            ret['imgs'][idx] = ret['imgs'][idx].repeat(1, 3, 1, 1) # B, 3, H, W
+        ret['imgs_grey'][idx] = 255.*ret['imgs_grey'][idx] # B, H, W
+        ret['imgs'][idx] = 255.*torch.permute(ret['imgs'][idx], (0, 2, 3, 1)) # B, H, W, 3
+
+    ret['image_size1'] = im_size1 = data['view0']['image_size'] # B * 2
+    ret['image_size2'] = im_size2 = data['view1']['image_size'] # B * 2
+    # print("Image size shape and contents: ", im_size1.shape, im_size1, flush=True)
+    pts1_virt_b, pts2_virt_b = get_virt_x1x2_grid_torch(im_size1, im_size2) # B * N * 2
+
+    K1 = data['view0']['camera'].calibration_matrix() # B * 3 * 3
+    K2 = data['view1']['camera'].calibration_matrix() # B * 3 * 3
+    ret['K1'], ret['K2'] = K1, K2
+    # print("K1 content: ", K1[0], flush=True)
+    ret['K1_inv'], ret['K2_inv'] = torch.inverse(K1), torch.inverse(K2)
+
+    tcross = torch.zeros_like(data['T_0to1'].R)
+    tcross[:, 0, 1] = -data['T_0to1'].t[:, 2]
+    tcross[:, 0, 2] = data['T_0to1'].t[:, 1]
+    tcross[:, 1, 0] = data['T_0to1'].t[:, 2]
+    tcross[:, 1, 2] = -data['T_0to1'].t[:, 0]
+    tcross[:, 2, 0] = -data['T_0to1'].t[:, 1]
+    tcross[:, 2, 1] = data['T_0to1'].t[:, 0]
+
+    # {q, t}_scene are not ultimately used
+    ret['q_scene'] = rotation_matrix_to_quaternion(torch.cat([data['T_0to1'].R, data['T_0to1'].t.unsqueeze(-1)], dim=-1))
+    ret['q_scene'] = ret['q_scene'].unsqueeze(-1)
+    ret['t_scene'] = data['T_0to1'].t
+    ret['t_scene'] = ret['t_scene'].unsqueeze(-1)
+
+    # {q, t}_cam are used only if if_qt_loss is on
+    pose_0to1 = data['T_0to1'].inv()
+    ret['q_cam'] = rotation_matrix_to_quaternion(torch.cat([pose_0to1.R, pose_0to1.t.unsqueeze(-1)], dim=-1))
+    ret['q_cam'] = ret['q_cam'].unsqueeze(-1)
+    ret['t_cam'] = pose_0to1.t
+    ret['t_cam'] = ret['t_cam'].unsqueeze(-1)
+
+    gt_E = torch.matmul(tcross, data['T_0to1'].R) # B * 3 * 3
+    gt_F = torch.matmul(torch.matmul(torch.inverse(K2).transpose(-1, -2), gt_E), torch.inverse(K1)) # B * 3 * 3
+    ret['E'] = gt_E
+    ret['F'] = gt_F
+
+    B = gt_E.shape[0]
+    ret['relative_scene_poses'] = torch.eye(4, device='cuda:0').repeat(B, 1, 1)
+    ret['relative_scene_poses'][:, :3, :3] = data['T_0to1'].R
+    ret['relative_scene_poses'][:, :3, 3] = data['T_0to1'].t
+
+    pts1_virts = []
+    pts2_virts = []
+    for b in range(B):
+        pts1_virt, pts2_virt = get_virt_x1x2_np(
+            ret["F"][b].cpu().numpy(),
+            pts1_virt_b[b].cpu().numpy(),
+            pts2_virt_b[b].cpu().numpy(),
+        )
+        pts1_virts.append(torch.from_numpy(pts1_virt).to(device='cuda:0').float())
+        pts2_virts.append(torch.from_numpy(pts2_virt).to(device='cuda:0').float())
+    ret['pts1_virt'] = torch.stack(pts1_virts, dim=0)
+    ret['pts2_virt'] = torch.stack(pts2_virts, dim=0)
+
+    ret['frame_ids'] = [
+        name1 + '+' + name2 for (name1, name2) in zip(data['view0']['name'], data['view1']['name'])
+    ]
+
+    return ret
 
 ##### end functions #####
 
 
-class Train_model_pipeline(Train_model_frontend):
+class Train_model_pipeline_megadepth(Train_model_frontend):
     """
-    * training for deepFEPE
+    * training for deepFEPE on MegaDepth dataset
     """
 
     def __init__(self, config, save_path=".", args={}, device="cpu", verbose=False):
         self.config = config
         self.device = device
         self.save_path = save_path
-        logging.info(f"set 'Train_model_pipeline' save_path: {save_path}")
+        logging.info(f"set 'Train_model_pipeline_megadepth' save_path: {save_path}")
         self.args = args
         # set training params
         self.clamp_cum = config["model"]["clamp_at"]
@@ -128,7 +331,7 @@ class Train_model_pipeline(Train_model_frontend):
         # update learning rate based on number of epochs.
         """
         config = self.config
-        cur_lr = Train_model_pipeline.adjust_learning_rate(
+        cur_lr = Train_model_pipeline_megadepth.adjust_learning_rate(
             self.optimizer,
             self.epoch,
             config["training"]["learning_rate"],
@@ -180,7 +383,7 @@ class Train_model_pipeline(Train_model_frontend):
             "err_t",
             "epi_dists",
             "relative_poses_cam",
-            "relative_poses_body",
+            # "relative_poses_body",
         ]
         dict_of_lists_in_train = init_dict_of_lists(config, self.save_lists)
         dict_of_lists_in_val = init_dict_of_lists(config, self.save_lists)
@@ -279,7 +482,7 @@ class Train_model_pipeline(Train_model_frontend):
                     )
                     dict_of_lists["epi_dists"] = dict_of_lists["epi_dists"][:, :10]  ### only take part of it
                     np.savez(
-                        f'{self.save_path[:-11]}/{our_name}_{config["exps"]["filename"]}',
+                        f'{str(self.save_path)[:-11]}/{our_name}_{config["exps"]["filename"]}',
                         **dict_of_lists,
                     )
                     # save base_name
@@ -288,7 +491,7 @@ class Train_model_pipeline(Train_model_frontend):
                     )
                     dict_of_lists["epi_dists"] = dict_of_lists["epi_dists"][:, :10]  ### only take part of it
                     np.savez(
-                        f'{self.save_path[:-11]}/{base_name}_{config["exps"]["filename"]}',
+                        f'{str(self.save_path)[:-11]}/{base_name}_{config["exps"]["filename"]}',
                         **dict_of_lists,
                     )
                 # output then flush
@@ -315,16 +518,21 @@ class Train_model_pipeline(Train_model_frontend):
         device = self.device
         # net, net_SP = self.net, self.net_SP
         writer = self.writer
+        
+        sample = dataprocess(sample)
 
         if_train_SP = config["training"].get("train_SP", True)
         if_train_deepF = config["training"].get("train", True)
         task = "training" if train else "validating"
         n_iter_sample = self.n_iter if train else self.n_iter_val
 
-        Ks = sample["K"].to(device)  # [batch_size, 3, 3]
-        K_invs = sample["K_inv"].to(device)  # [batch_size, 3, 3]
-        batch_size = Ks.size(0)
-        scene_names = sample["scene_name"]
+        # Ks = sample["K"].to(device)  # [batch_size, 3, 3]
+        K1s = sample["K1"].to(device)  # [batch_size, 3, 3]
+        K2s = sample["K2"].to(device)  # [batch_size, 3, 3]
+        K1_invs = sample["K1_inv"].to(device)  # [batch_size, 3, 3]
+        K2_invs = sample["K2_inv"].to(device)  # [batch_size, 3, 3]
+        batch_size = K1s.size(0)
+        # scene_names = sample["scene_name"]
         frame_ids = sample["frame_ids"]
         scene_poses = sample[
             "relative_scene_poses"
@@ -344,9 +552,10 @@ class Train_model_pipeline(Train_model_frontend):
         # if train_params['if_des']:
         #     des_good = sample['des_good']
 
-        delta_Rtijs_4_4 = scene_poses[
-            1
-        ].float()  # [batch_size, 4, 4], asserting we have 2 frames where scene_poses[0] are all identities
+        # delta_Rtijs_4_4 = scene_poses[
+        #     1
+        # ].float()  # [batch_size, 4, 4], asserting we have 2 frames where scene_poses[0] are all identities
+        delta_Rtijs_4_4 = scene_poses.float() # [batch_size, 4, 4], asserting we have 2 frames where scene_poses[0] are all identities
         # E_gts, F_gts = utils_F._E_F_from_Rt(delta_Rtijs_4_4[:, :3, :3], delta_Rtijs_4_4[:, :3, 3:4], Ks, tensor_input=True)
         E_gts, F_gts = sample["E"], sample["F"]
         # pts1_virt_normalizedK, pts2_virt_normalizedK = sample['pts1_virt_normalized'].cuda(), sample['pts2_virt_normalized'].cuda()
@@ -369,12 +578,12 @@ class Train_model_pipeline(Train_model_frontend):
             if not if_train_SP:
                 with torch.no_grad():
                     self.net_SP.eval()
-                    data = get_matches_from_SP(
-                        sample["imgs_grey"], self.net_SP, self.SP_processer, self.SP_tracker
+                    data = get_matches_from_SP_withsize(
+                        sample["imgs_grey"], [sample['image_size1'], sample['image_size2']], self.net_SP, self.SP_processer, self.SP_tracker
                     )
             else:
-                data = get_matches_from_SP(
-                    sample["imgs_grey"], self.net_SP, self.SP_processer, self.SP_tracker
+                data = get_matches_from_SP_withsize(
+                    sample["imgs_grey"], [sample['image_size1'], sample['image_size2']], self.net_SP, self.SP_processer, self.SP_tracker
                 )
 
             # {'xs': xs, 'offsets': offsets, 'quality': quality, 'num_matches': num_matches}
@@ -385,6 +594,11 @@ class Train_model_pipeline(Train_model_frontend):
             matches_use = xs + offsets
 
             quality_use = quality
+
+            # For sanity check, replace matches with ground truth
+            # matches_use = matches_use.detach().cpu().numpy()
+            
+
         else:
             if_SIFT = True
             if if_SIFT:
@@ -404,12 +618,12 @@ class Train_model_pipeline(Train_model_frontend):
 
         x1_normalizedK = utils_misc._de_homo(
             torch.matmul(
-                torch.inverse(Ks), utils_misc._homo(x1.to(device)).transpose(1, 2)
+                torch.inverse(K1s), utils_misc._homo(x1.to(device)).transpose(1, 2)
             ).transpose(1, 2)
         )  # [batch_size, N, 2(W, H)], min/max_X=[-W/2/f, W/2/f]
         x2_normalizedK = utils_misc._de_homo(
             torch.matmul(
-                torch.inverse(Ks), utils_misc._homo(x2.to(device)).transpose(1, 2)
+                torch.inverse(K2s), utils_misc._homo(x2.to(device)).transpose(1, 2)
             ).transpose(1, 2)
         )  # [batch_size, N, 2(W, H)], min/max_X=[-W/2/f, W/2/f]
         matches_use_normalizedK = torch.cat((x1_normalizedK, x2_normalizedK), 2)
@@ -422,7 +636,7 @@ class Train_model_pipeline(Train_model_frontend):
             imgs_stack = ((torch.cat(imgs, 3).float() - 127.5) / 127.5).permute(
                 0, 3, 1, 2
             )
-
+        
         qs_scene = sample["q_scene"].cuda()  # [B, 4, 1]
         ts_scene = sample["t_scene"].cuda()  # [B, 3, 1]
         qs_cam = sample["q_cam"].cuda()  # [B, 4, 1]
@@ -431,19 +645,19 @@ class Train_model_pipeline(Train_model_frontend):
 
         t_scene_scale = torch.norm(ts_scene, p=2, dim=1, keepdim=True)
 
+        # TODO: Temporal visualization starts here
         # print("Matches shape: ", matches_use_ori[...,:2].shape, matches_use_ori[...,2:].shape, flush=True)
         # print("Matches range: ", matches_use_ori[...,:2].max(), matches_use_ori[...,:2].min(), \
         #     matches_use_ori[...,2:].max(), matches_use_ori[...,2:].min(), flush=True)
-        # print("Image shape: ", sample["imgs"][1].shape, sample["imgs"][1].min(), sample["imgs"][1].max(), flush=True)
-        # print("Image number: ", len(sample["imgs"]), flush=True)
+        # print("Image shape: ", sample["imgs"][0].shape, sample["imgs"][0].min(), sample["imgs"][0].max(), flush=True)
 
         # import matplotlib.pyplot as plt
         # from matplotlib.patches import ConnectionPatch
         # for b in range(4):
         #     f, axarr = plt.subplots(1,2, figsize=(20,10))
         #     # print("Image name, size, shape: ", frame_ids[b], sample['imgs'][0][b].shape, sample['image_size1'][b], flush=True)
-        #     axarr[0].imshow((sample['imgs'][0][b]/255.).cpu().numpy())
-        #     axarr[1].imshow((sample['imgs'][1][b]/255.).cpu().numpy())
+        #     axarr[0].imshow((sample['imgs'][0][b][:sample['image_size1'][b][1], :sample['image_size1'][b][0],:]/255.).cpu().numpy())
+        #     axarr[1].imshow((sample['imgs'][1][b][:sample['image_size2'][b][1], :sample['image_size2'][b][0],:]/255.).cpu().numpy())
         #     # points1 = torch.cat([points[b, :, :2], torch.ones_like(points[b, :, [0]], device=device)], dim=-1)
         #     # points2 = torch.cat([points[b, :, 2:], torch.ones_like(points[b, :, [2]], device=device)], dim=-1)
         #     # px_points1 = torch.matmul(K1s[b], points1.transpose(-1, -2)).transpose(-1, -2)[:, :2].cpu().numpy()
@@ -465,13 +679,18 @@ class Train_model_pipeline(Train_model_frontend):
 
         #         axarr[0].plot(px_points1[i][0], px_points1[i][1],'ro',markersize=2)
         #         axarr[1].plot(px_points2[i][0], px_points2[i][1],'ro',markersize=2)
-        #     plt.savefig(f"/cluster/project/cvg/students/shikim/fully-differentiable-global-sfm/visualizations_kitti/{frame_ids[0][b]}.png")
+        #     # Set title
+        #     plt.suptitle(f"sized {sample['image_size1'][b]} and {sample['image_size2'][b]}")
+        #     plt.savefig(f"/cluster/project/cvg/students/shikim/fully-differentiable-global-sfm/visualizations/{frame_ids[b]}.png")
         #     plt.clf()
+        # TODO: Temporal visaulization ends here
 
-        # print("E and F and Calculated F: ", sample["E"][0], sample["F"][0], (Ks.transpose(1, 2).cpu()@sample["F"]@Ks.cpu())[0], flush=True)
+        # print("E and F and Calculated F: ", sample["E"][0], sample["F"][0], (K2s.transpose(1, 2).cpu()@sample["F"]@K1s.cpu())[0], flush=True)
 
-        # from dsac_tools import utils_F
+        # For sanity check, replace matches_use_ori with pts1_virt_ori and pts2_virt_ori
+        # matches_use_ori = torch.cat([pts1_virt_ori[...,:2], pts2_virt_ori[...,:2]], dim=2)
         # print("Virt dot product: ", (pts2_virt_ori.cuda() @ sample["F"].cuda() @ pts1_virt_ori.transpose(1, 2).cuda()).abs().mean(), flush=True)
+        # from dsac_tools import utils_F
         # print("Virt dot product: ", utils_F.compute_epi_residual(pts1_virt_ori.cpu(), pts2_virt_ori.cpu(), F_gts, 1.0).mean())
 
         # Make data batch
@@ -481,13 +700,17 @@ class Train_model_pipeline(Train_model_frontend):
             "quality": quality_use,
             "x1_normalizedK": x1_normalizedK,
             "x2_normalizedK": x2_normalizedK,
-            "Ks": Ks,
-            "K_invs": K_invs,
+            "K1s": K1s,
+            "K2s": K2s,
+            "K1_invs": K1_invs,
+            "K2_invs": K2_invs,
             "des1": None,
             "des2": None,
             "matches_good_unique_nums": sample["matches_good_unique_nums"],
             "t_scene_scale": t_scene_scale,
             "frame_ids": sample["frame_ids"],
+            'image_size1': sample['image_size1'],
+            'image_size2': sample['image_size2'],
         }
         # if train_params['if_des']:
         #     data_batch['des1'] = des_good[:, :, :128].cuda()
@@ -537,10 +760,12 @@ class Train_model_pipeline(Train_model_frontend):
         reg = 0.0
 
         if train:
+            # print("K1 K2 confirmation: ", K1s[0], K2s[0], flush=True)
             outs = self.net(data_batch)
             # loss, loss_layers, loss_E, E_ests, logits_weights, logits = get_all_loss(
             #     outs, x1_normalizedK, x2_normalizedK, pts1_virt_normalizedK, pts2_virt_normalizedK, Ks, E_gts, loss_params)
-            print("output keys: ", outs.keys())
+            # print("output keys: ", outs.keys())
+            # print("pts1 and pts 2:")
             ## get losses (deepF, f-loss)
             (
                 losses_dict,
@@ -550,11 +775,12 @@ class Train_model_pipeline(Train_model_frontend):
                 residual_norm_layers,
                 residual_norm_max_layers,
                 E_ests_layers,
-            ) = get_all_loss_DeepF(
+            ) = get_all_loss_DeepF_notsym(
                 outs,
                 pts1_virt_ori,
                 pts2_virt_ori,
-                Ks,
+                K1s,
+                K2s,
                 loss_params,
                 get_residual_summaries=get_residual_summaries,
             )
@@ -587,9 +813,10 @@ class Train_model_pipeline(Train_model_frontend):
             if config["model"]["if_qt_loss"]:
                 # to_cpu = lambda x: x.cpu()
                 ## detach x1, x2 to calculate loss
-                geo_errors_dict = get_Rt_loss(
+                geo_errors_dict = get_Rt_loss_notsym(
                     E_ests_layers,
-                    sample["K"],
+                    sample["K1"],
+                    sample["K2"],
                     x1.detach().cpu(),
                     x2.detach().cpu(),
                     delta_Rtijs_4_4,
@@ -631,61 +858,70 @@ class Train_model_pipeline(Train_model_frontend):
                     loss = loss_q * balance_q + loss_t * balance_t
                     # loss += loss_F * balance_F
                     print(loss_q.item(), loss_t.item())
+                
 
             # zero the parameter gradients, train the models!!
             if if_train_deepF:
                 self.optimizer.zero_grad()
             if self.if_SP and if_train_SP:
                 self.optimizer_SP.zero_grad()
-            loss.backward()
-            # nn.utils.clip_grad_norm_(net.parameters(), config['training']['gradient_clip'])
-            # nn.utils.clip_grad_norm_(net.parameters(), 0.1)
-            def check_skip_condition(skip_condition, loss):
-                if skip_condition is None:
-                    return False
-                if skip_condition.get("enable", False):
-                    if loss <= skip_condition["params"]["epi_min"]:
-                        return True
-                return False
-
-            def add_msg_to_log(log_file, msg):
-                with open(log_file, "a") as log_f:
-                    log_f.write(f"{msg}\n")
-                pass
-
-            if_skip = config["training"].get("skip_optimizer", None)
-
-            ## add msgs to log file
-            # loss_min_batch = losses_dict["loss_min_batch"]
-            for i, (frame_id, loss_temp) in enumerate(
-                zip(np.array(data_batch["frame_ids"]).T, losses_dict["loss_min_batch"])
-            ):
-                if check_skip_condition(if_skip, loss_temp):
-                    add_msg_to_log(
-                        Path(self.save_path) / "log.txt",
-                        f"loss is lower than epi_min. loss: {loss_min}, frame_id: {frame_id}",
-                    )
-            ## for debugging
-            skip = False
-            if if_skip is not None:
-                logging.info(
-                    f"loss_min: {loss_min}, loss_batch: {losses_dict['loss_min_batch']}"
-                )
-                skip = check_skip_condition(if_skip, loss_min)
             
-            ## optimizer step
-            if skip or not if_train_deepF:
-                logging.info(f"skip optimizing: {loss}")
-                logging.info(
-                    f"loss_min: {loss_min}, loss_batch: {losses_dict['loss_min_batch']}"
-                )
-                logging.info(f"frames: {data_batch['frame_ids']}")
-                # logging.info("optimizer!!")
-            else:
-                self.optimizer.step()
-            if self.if_SP and if_train_SP:
-                logging.info("training SP")
-                self.optimizer_SP.step()
+            try:
+                with torch.autograd.set_detect_anomaly(True):
+                    loss.backward()
+                
+                # nn.utils.clip_grad_norm_(net.parameters(), config['training']['gradient_clip'])
+                # nn.utils.clip_grad_norm_(net.parameters(), 0.1)
+                def check_skip_condition(skip_condition, loss):
+                    if skip_condition is None:
+                        return False
+                    if skip_condition.get("enable", False):
+                        if loss <= skip_condition["params"]["epi_min"]:
+                            return True
+                    return False
+
+                def add_msg_to_log(log_file, msg):
+                    with open(log_file, "a") as log_f:
+                        log_f.write(f"{msg}\n")
+                    pass
+
+                if_skip = config["training"].get("skip_optimizer", None)
+
+                ## add msgs to log file
+                # loss_min_batch = losses_dict["loss_min_batch"]
+                for i, (frame_id, loss_temp) in enumerate(
+                    zip(np.array(data_batch["frame_ids"]).T, losses_dict["loss_min_batch"])
+                ):
+                    if check_skip_condition(if_skip, loss_temp):
+                        add_msg_to_log(
+                            Path(self.save_path) / "log.txt",
+                            f"loss is lower than epi_min. loss: {loss_min}, frame_id: {frame_id}",
+                        )
+                ## for debugging
+                skip = False
+                if if_skip is not None:
+                    logging.info(
+                        f"loss_min: {loss_min}, loss_batch: {losses_dict['loss_min_batch']}"
+                    )
+                    skip = check_skip_condition(if_skip, loss_min)
+                
+                ## optimizer step
+                if skip or not if_train_deepF:
+                    logging.info(f"skip optimizing: {loss}")
+                    logging.info(
+                        f"loss_min: {loss_min}, loss_batch: {losses_dict['loss_min_batch']}"
+                    )
+                    logging.info(f"frames: {data_batch['frame_ids']}")
+                    # logging.info("optimizer!!")
+                else:
+                    self.optimizer.step()
+                if self.if_SP and if_train_SP:
+                    logging.info("training SP")
+                    self.optimizer_SP.step()
+                
+            except Exception as e:
+                print(e, flush=True)
+                print("Error in backward pass", flush=True)
 
         # testing
         else:
@@ -703,11 +939,12 @@ class Train_model_pipeline(Train_model_frontend):
                     residual_norm_layers,
                     residual_norm_max_layers,
                     E_ests_layers,
-                ) = get_all_loss_DeepF(
+                ) = get_all_loss_DeepF_notsym(
                     outs,
                     pts1_virt_ori,
                     pts2_virt_ori,
-                    Ks,
+                    K1s,
+                    K2s,
                     loss_params,
                     get_residual_summaries=get_residual_summaries,
                 )
@@ -735,9 +972,10 @@ class Train_model_pipeline(Train_model_frontend):
 
                 ## pose loss (pose-loss)
                 if config["model"]["if_qt_loss"]:
-                    geo_errors_dict = get_Rt_loss(
+                    geo_errors_dict = get_Rt_loss_notsym(
                         E_ests_layers,
-                        sample["K"],
+                        sample["K1"],
+                        sample["K2"],
                         x1.cpu(),
                         x2.cpu(),
                         delta_Rtijs_4_4,
@@ -1008,7 +1246,8 @@ class Train_model_pipeline(Train_model_frontend):
                 E_recover_110_lists.append(E_recover_110)
             E_ests_110 = torch.stack(E_recover_110_lists)
 
-            K_np = Ks.cpu().numpy()
+            K1_np = K1s.cpu().numpy()
+            K2_np = K2s.cpu().numpy()
             x1_np, x2_np = x1.detach().cpu().numpy(), x2.detach().cpu().numpy()
             E_est_np = E_ests_110.detach().cpu().numpy()
             E_gt_np = E_gts.cpu().numpy()
@@ -1092,9 +1331,10 @@ class Train_model_pipeline(Train_model_frontend):
             ## multi-thread for validation
             with ProcessPool(max_workers=default_number_of_process) as pool:
                 tasks = pool.map(
-                    val_rt, # function called
+                    val_rt_notsym, # function called
                     range(batch_size),
-                    [K_np[idx] for idx in range(batch_size)],
+                    [K1_np[idx] for idx in range(batch_size)],
+                    [K2_np[idx] for idx in range(batch_size)],
                     [x1_np[idx] for idx in range(batch_size)],
                     [x2_np[idx] for idx in range(batch_size)],
                     [E_est_np[idx] for idx in range(batch_size)],
@@ -1137,8 +1377,9 @@ class Train_model_pipeline(Train_model_frontend):
                                 np.expand_dims(epi_dist_mean_estW, -1)
                             )
 
-                            Rt_cam2_gt_np = sample["Rt_cam2_gt"].numpy()
-                            logging.info(f"Rt_cam2_gt_np: {Rt_cam2_gt_np.shape}, M_estW: {M_estW.shape}")
+                            # Rt_cam2_gt_np = sample["Rt_cam2_gt"].numpy()
+                            logging.info(f"M_estW: {M_estW.shape}")
+                            # logging.info(f"Rt_cam2_gt_np: {Rt_cam2_gt_np.shape}, M_estW: {M_estW.shape}")
                             # logging.info(f"Rt_cam2_gt_np: {Rt_cam2_gt_np[0]}")
                             def relative_pose_cam_to_body(
                                 relative_scene_pose, Rt_cam2_gt
@@ -1152,16 +1393,16 @@ class Train_model_pipeline(Train_model_frontend):
                                 )
                                 return relative_scene_pose
 
-                            M_estW_body = relative_pose_cam_to_body(
-                                M_estW, Rt_cam2_gt_np[i]
-                            )
+                            # M_estW_body = relative_pose_cam_to_body(
+                            #     M_estW, Rt_cam2_gt_np[i]
+                            # )
                             dict_of_lists["relative_poses_cam"][our_name].append(M_estW)
                             # print(f"M_estW: {M_estW}")
                             # print(f"M_estW_body: {M_estW_body}")
                             # save estimated poses
-                            dict_of_lists["relative_poses_body"][our_name].append(
-                                M_estW_body
-                            )
+                            # dict_of_lists["relative_poses_body"][our_name].append(
+                            #     M_estW_body
+                            # )
 
                             ### baseline and gt
                             dict_of_lists["err_q"][base_name].append(error_Rt_5point[0])
@@ -1175,17 +1416,17 @@ class Train_model_pipeline(Train_model_frontend):
                             # M_gt_body = relative_pose_cam_to_body(
                             #     delta_Rtijs_4_4_cpu_np[i], Rt_cam2_gt_np[i]
                             # )
-                            M_opencv_body = relative_pose_cam_to_body(
-                                M_opencv, Rt_cam2_gt_np[i]
-                            )
+                            # M_opencv_body = relative_pose_cam_to_body(
+                            #     M_opencv, Rt_cam2_gt_np[i]
+                            # )
                             dict_of_lists["relative_poses_cam"][base_name].append(
                                 # delta_Rtijs_4_4_cpu_np[i]
                                 M_opencv
                             )
-                            dict_of_lists["relative_poses_body"][base_name].append(
-                                M_opencv_body
-                                # M_gt_body
-                            )
+                            # dict_of_lists["relative_poses_body"][base_name].append(
+                            #     M_opencv_body
+                            #     # M_gt_body
+                            # )
                             # print(f"M_gt_body: {M_gt_body}")
                             ## gt
                             dict_of_lists["err_q"]["gt"].append(error_Rt_gt[0])

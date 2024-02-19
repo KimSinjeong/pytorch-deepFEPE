@@ -1,0 +1,96 @@
+data:
+  batch_size: 4
+  cache_in_memory: true
+  dataset: kitti_odo_corr
+  delta_ij: 1
+  dump_root: /cluster/home/shikim/cvgproj/fdsfmdata/kitti_dump
+  good_num: 1000
+  image:
+    size:
+    - 376
+    - 1241
+    - 3
+  preprocessing:
+    resize:
+    - 376
+    - 1240
+  read_params:
+    use_h5: false
+  read_what:
+    with_SP: false
+    with_X: false
+    with_imgs: false
+    with_pose: true
+    with_qt: true
+    with_quality: true
+    with_sift: true
+    with_sift_des: false
+  sequence_length: 2
+desc: No Sp, Train deepF
+exps:
+  base_name: opencv_8p
+  filename: err_ratio.npz
+  five_point: false
+  our_name: DeepF
+model:
+  balance_q: 1
+  balance_t: 0.1
+  clamp_at: 0.02
+  depth: 5
+  if_SP: true
+  if_cpu_svd: true
+  if_goodCorresArch: false
+  if_img_des_to_pointnet: false
+  if_img_feat: false
+  if_learn_offsets: false
+  if_lidar_corres: false
+  if_qt_loss: false
+  if_quality: false
+  if_sample_loss: false
+  if_tri_depth: false
+  name: GoodCorresNet_layers_deepF
+  quality_size: 0
+name: kitti_odo_good_corr
+seed: 0
+training:
+  SP_params:
+    conf_thresh: 0.015
+    nms_dist: 4
+    nn_thresh: 1.0
+    out_num_points: 1000
+    patch_size: 5
+  clamp_iter1: 3000
+  clamp_iter2: 6000
+  clamp_q_params:
+  - 0.1
+  - 0.01
+  - 0.001
+  clamp_t_params:
+  - 0.5
+  - 0.3
+  - 0.1
+  learning_rate: 0.0001
+  lr_decay_rate: 1
+  lr_decay_step: 10
+  pretrained: ''
+  pretrained_SP: deepFEPE/logs/superpoint_kitti_heat2_0/checkpoints/superPointNet_50000_checkpoint.pth.tar
+  reproduce: false
+  reset_iter: true
+  reset_iter_SP: false
+  retrain: true
+  retrain_SP: false
+  save_interval: 250
+  seed: 0
+  skip_optimizer:
+    enable: false
+    params:
+      epi_min: 0.001
+  train: true
+  train_SP: false
+  train_iter: 100000
+  val_batches: 10
+  val_interval: 1000
+  val_interval_in_train: 1000
+  val_show_interval: 100
+  workers_train: 16
+  workers_val: 2

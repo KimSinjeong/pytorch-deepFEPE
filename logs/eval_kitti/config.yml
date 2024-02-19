@@ -1,0 +1,83 @@
+data:
+  batch_size: 4
+  cache_in_memory: true
+  dataset: kitti_odo_corr
+  delta_ij: 1
+  dump_root: /cluster/home/shikim/cvgproj/fdsfmdata/kitti_dump
+  good_num: 1000
+  image:
+    size:
+    - 376
+    - 1241
+    - 3
+  preprocessing:
+    resize:
+    - 376
+    - 1240
+  read_params:
+    use_h5: false
+  read_what:
+    with_SP: false
+    with_X: false
+    with_imgs: false
+    with_imgs_gamma: 1
+    with_pose: true
+    with_qt: true
+    with_quality: true
+    with_sift: true
+    with_sift_des: false
+  sequence_length: 2
+desc: Eval on kitti
+exps:
+  base_name: opencv_8p
+  filename: err_ratio.npz
+  five_point: false
+  our_name: DeepF
+model:
+  clamp_at: 0.02
+  depth: 5
+  if_SP: true
+  if_cpu_svd: true
+  if_goodCorresArch: false
+  if_img_des_to_pointnet: false
+  if_img_feat: false
+  if_learn_offsets: false
+  if_lidar_corres: false
+  if_qt_loss: false
+  if_quality: false
+  if_sample_loss: false
+  if_tri_depth: false
+  name: GoodCorresNet_layers_deepF
+  quality_size: 2
+name: kitti_odo_good_corr
+seed: 0
+training:
+  SP_params:
+    conf_thresh: 0.015
+    nms_dist: 4
+    nn_thresh: 1.0
+    out_num_points: 1000
+    patch_size: 5
+  learning_rate: 0.0001
+  lr_decay_rate: 0.9
+  lr_decay_step: 10
+  pretrained: /cluster/project/cvg/students/shikim/fully-differentiable-global-sfm/submodules/pytorch-deepFEPE/logs/test_kitti/checkpoints/deepFNet_35000_checkpoint.pth.tar
+  pretrained_SP: deepFEPE/logs/superpoint_kitti_heat2_0/checkpoints/superPointNet_50000_checkpoint.pth.tar
+  reproduce: true
+  reset_iter: true
+  reset_iter_SP: false
+  retrain: false
+  retrain_SP: false
+  save_interval: 10
+  seed: 0
+  skip_optimizer:
+    enable: false
+  train: false
+  train_SP: false
+  train_iter: 0
+  val_batches: -1
+  val_interval: 1
+  val_interval_in_train: 1000
+  val_show_interval: 1
+  workers_train: 16
+  workers_val: 8

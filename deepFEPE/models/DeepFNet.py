@@ -119,6 +119,42 @@ class NormalizeAndExpand_HW(nn.Module):
 
         return pts1, pts2, T1, T2
 
+class NormalizeAndExpand_unknownHW(nn.Module):
+    # so that the coordintes are normalized to [-1, 1] for both H and W
+    def __init__(self, is_cuda=True, is_test=False):
+        super(NormalizeAndExpand_unknownHW, self).__init__()
+
+        self.ones_b = Variable(torch.ones((1, 1, 1)), volatile=is_test)
+        # self.T_b = Variable(torch.zeros(1, 3, 3), volatile=is_test)
+
+        if is_cuda:
+            self.ones_b = self.ones_b.cuda()
+            # self.T_b = self.T_b.cuda()
+            # self.T = self.T.cuda()
+
+    def normalize(self, pts, image_size):
+        # image_size: B, 2
+
+        ones = self.ones_b.expand(pts.size(0), pts.size(1), 1)
+        # T = torch.tensor([[2./self.W, 0., -1.], [0., 2./self.H, -1.], [0., 0., 1.]], device=pts.device, dtype=pts.dtype).unsqueeze(0).expand(pts.size(0), -1, -1)
+        T = torch.zeros(pts.size(0), 3, 3, device=pts.device, dtype=pts.dtype)
+        T[:, 0, 0] = 2./image_size[:, 0] # W
+        T[:, 1, 1] = 2./image_size[:, 1] # H
+        T[:, 0, 2] = -1.
+        T[:, 1, 2] = -1.
+        T[:, 2, 2] = 1.
+        pts = torch.cat((pts, ones), 2)
+        pts_out = T @ pts.permute(0,2,1)
+        # print("Debug purpose: pts_out size: ", pts_out.size(), flush=True)
+        # print("Debug purpose: if there's points outside (-1, 1): ", (pts_out[:,:2,:].abs() > (1. - 1e-10)).sum(), flush=True)
+        return pts_out, T
+
+    def forward(self, pts, image_size1, image_size2):
+        pts1, T1 = self.normalize(pts[:,:,:2], image_size1)
+        pts2, T2 = self.normalize(pts[:,:,2:], image_size2)
+
+        return pts1, pts2, T1, T2
+
 ## get fundamental matrix and residuals
 class Fit(nn.Module):
     def __init__(self, is_cuda=True, is_test=False, if_cpu_svd=False, normalize_SVD=True):
@@ -217,7 +253,7 @@ class Fit(nn.Module):
         F_vecs_list = []
         ## usually use GPU to calculate SVD and F matrix
         if self.if_cpu_svd:
-            X = set_nan2zero(X)  # check if NAN
+            X = set_nan2zero(X, "DeepF")  # check if NAN
             for b in range(X.size(0)):
                 # logging.info(f"X[b]: {X[b]}")
                 _, _, V = torch.svd(X[b].cpu())
@@ -349,7 +385,12 @@ class DeepFNet(nn.Module):
 
         # self.norm = NormalizeAndExpand(is_cuda, is_test)
         # self.norm_K = NormalizeAndExpand_K(is_cuda, is_test)
-        self.norm_HW = NormalizeAndExpand_HW(self.image_size, is_cuda, is_test)
+        if self.image_size[0] == 0 and self.image_size[1] == 0:
+            # print("Debug Purpose: NormalizeAndExpand_unknownHW", flush=True)
+            self.norm_HW = NormalizeAndExpand_unknownHW(is_cuda, is_test)
+        else:
+            # print("Debug Purpose: NormalizeAndExpand_HW", flush=True)
+            self.norm_HW = NormalizeAndExpand_HW(self.image_size, is_cuda, is_test)
         self.fit  = Fit(is_cuda, is_test, if_cpu_svd)
         self.depth = depth
 
@@ -374,7 +415,12 @@ class DeepFNet(nn.Module):
 
         # pts1, pts2, T1, T2 = self.norm(pts) # pts: [b, N, 2] # \in [-1, 1]
         # pts1, pts2, T1, T2 = self.norm_K(pts, data_batch['K_invs']) # pts: [b, N, 2] # \in [-1, 1]
-        pts1, pts2, T1, T2 = self.norm_HW(pts)
+        if self.image_size[0] == 0 and self.image_size[1] == 0:
+            # print("image sizes confirmation: ", data_batch['image_size1'][0], data_batch['image_size2'][0])
+            pts1, pts2, T1, T2 = self.norm_HW(pts, data_batch['image_size1'], data_batch['image_size2'])
+            # print("T1 T2 confirmation: ", T1[0], T2[0], T1.dtype, flush=True)
+        else:
+            pts1, pts2, T1, T2 = self.norm_HW(pts)
         # print(pts1.max(-1)[0].max(0)[0], pts1.min(-1)[0].min(0)[0])
         # pts1_recover = torch.inverse(T1) @ pts1
         # print(pts1_recover.max(-1)[0].max(0)[0], pts1_recover.min(-1)[0].min(0)[0])
@@ -405,23 +451,45 @@ class DeepFNet(nn.Module):
 
     def get_depth(self, data_batch, F_out, T1, T2):
         F_ests = T2.permute(0,2,1) @ F_out @ T1
-        E_ests = data_batch['Ks'].transpose(1, 2) @ F_ests @ data_batch['Ks']
-        depth_list = []
-        for E_hat, K, match in zip(E_ests, data_batch['Ks'], data_batch['matches_xy_ori']):
-            K = K.cpu().numpy()
-            p1p2 = match.cpu().numpy()
-            x1 = p1p2[:, :2]
-            x2 = p1p2[:, 2:]
-            num_inlier, R, t, mask_new = cv2.recoverPose(E_hat.detach().cpu().numpy().astype(np.float64), x1, x2, focal=K[0, 0], pp=(K[0, 2], K[1, 2]))
-            R1 = np.eye(3)
-            t1 = np.zeros((3, 1))
-            M1 = np.hstack((R1, t1))
-            M2 = np.hstack((R, t))
-            # print(np.linalg.norm(t))
-            X_tri_homo = cv2.triangulatePoints(np.matmul(K, M1), np.matmul(K, M2), x1.T, x2.T)
-            X_tri = X_tri_homo[:3, :]/X_tri_homo[-1, :]
-            depth = X_tri[-1, :].T
-            depth_list.append(depth)
+        if 'Ks' in data_batch:
+            E_ests = data_batch['Ks'].transpose(1, 2) @ F_ests @ data_batch['Ks']
+            depth_list = []
+            for E_hat, K, match in zip(E_ests, data_batch['Ks'], data_batch['matches_xy_ori']):
+                K = K.cpu().numpy()
+                p1p2 = match.cpu().numpy()
+                x1 = p1p2[:, :2]
+                x2 = p1p2[:, 2:]
+                num_inlier, R, t, mask_new = cv2.recoverPose(E_hat.detach().cpu().numpy().astype(np.float64), x1, x2, focal=K[0, 0], pp=(K[0, 2], K[1, 2]))
+                R1 = np.eye(3)
+                t1 = np.zeros((3, 1))
+                M1 = np.hstack((R1, t1))
+                M2 = np.hstack((R, t))
+                # print(np.linalg.norm(t))
+                X_tri_homo = cv2.triangulatePoints(np.matmul(K, M1), np.matmul(K, M2), x1.T, x2.T)
+                X_tri = X_tri_homo[:3, :]/X_tri_homo[-1, :]
+                depth = X_tri[-1, :].T
+                depth_list.append(depth)
+        else:
+            E_ests = data_batch['K2s'].transpose(1, 2) @ F_ests @ data_batch['K1s']
+            depth_list = []
+            for E_hat, K1, K2, match in zip(E_ests, data_batch['K1s'], data_batch['K2s'], data_batch['matches_xy_ori']):
+                K1 = K1.cpu().numpy()
+                K2 = K2.cpu().numpy()
+                p1p2 = match.cpu().numpy()
+                x1 = p1p2[:, :2]
+                x2 = p1p2[:, 2:]
+                x1_norm = cv2.undistortPoints(np.expand_dims(x1, axis=1), cameraMatrix=K1, distCoeffs=None)[:,0,:]
+                x2_norm = cv2.undistortPoints(np.expand_dims(x2, axis=1), cameraMatrix=K2, distCoeffs=None)[:,0,:]
+                num_inlier, R, t, mask_new = cv2.recoverPose(E_hat.detach().cpu().numpy().astype(np.float64), x1_norm, x2_norm)
+                R1 = np.eye(3)
+                t1 = np.zeros((3, 1))
+                M1 = np.hstack((R1, t1))
+                M2 = np.hstack((R, t))
+                # print(np.linalg.norm(t))
+                X_tri_homo = cv2.triangulatePoints(np.matmul(K1, M1), np.matmul(K2, M2), x1.T, x2.T)
+                X_tri = X_tri_homo[:3, :]/X_tri_homo[-1, :]
+                depth = X_tri[-1, :].T
+                depth_list.append(depth)
             # print(depth.flatten()[:10])
         depths = np.stack(depth_list) # [B, N]
         return torch.from_numpy(depths).unsqueeze(1).float().cuda()

@@ -2,9 +2,9 @@ name: 'kitti_odo_good_corr'
 desc: 'No Sp, Train deepF'
 
 data:
-    dataset: 'kitti_odo_corr'
+    dataset: 'MegaDepth'
     # dump_root: './deepFEPE/datasets/kitti_dump/odo_corr_dump_siftIdx_npy_delta1235810_full_1027' # on hyperion
-    dump_root: '/cluster/home/shikim/cvgproj/fdsfmdata/kitti_dump' # on hyperion
+    dump_root: './deepFEPE/datasets/kitti_dump/odo_corr_dump_siftIdx_npy_delta1_test_0713' # on hyperion
 
     cache_in_memory: true
     sequence_length: 2
@@ -21,7 +21,7 @@ data:
         with_qt: true
         with_imgs: false
     image:
-        size: [376, 1241, 3] # The size when you DUMP the image and SIFTs (sets the limit for the saved image and SIFT)
+        size: [0, 0, 3] # The size when you DUMP the image and SIFTs (sets the limit for the saved image and SIFT)
     preprocessing:
         # resize: [128, 416]
         # resize: [192, 624]
@@ -33,7 +33,7 @@ data:
 model:
     name: 'GoodCorresNet_layers_deepF'
     depth: 5
-    clamp_at: 0.02
+    clamp_at: 0.5
     if_quality: false # True
     if_goodCorresArch: False
     if_lidar_corres: false
@@ -78,6 +78,7 @@ training:
     train_iter: 100000
     # eval_iter: 200
     val_interval: 1000 # one validation of entire val set every N **training** steps
+    # val_interval: 5 # tmp val_interval for debugging
     val_interval_in_train: 1000
     val_batches: 10 # set to -1 to disable validation limit
     # train_show_interval: 200 # one show of the current training from to Tensorboard every N training steps
@@ -105,7 +106,7 @@ training:
     train_SP: false # false if freeze the weights
     reset_iter_SP: false
     # pretrained_SP: ''
-    pretrained_SP: 'deepFEPE/logs/superpoint_kitti_heat2_0/checkpoints/superPointNet_50000_checkpoint.pth.tar'
+    pretrained_SP: 'submodules/pytorch-deepFEPE/deepFEPE/logs/superpoint_kitti_heat2_0/checkpoints/superPointNet_50000_checkpoint.pth.tar'
     # pretrained_SP: 'logs/baselineTrain_kittiSp_deepF_end_kittiFLoss_freezeDeepF_v0/checkpoints/superPointNet_6000_checkpoint.pth.tar'
     # pretrained_SP: 'logs/baselineTrain_kittiSp_deepF_kittiFLoss_v0/checkpoints/superPointNet_18000_checkpoint.pth.tar'
     # pretrained_SP: 'logs/baselineTrain_kittiSp_deepF_end_kittiFLoss_freezeSp_v1/checkpoints/superPointNet_45000_checkpoint.pth.tar'

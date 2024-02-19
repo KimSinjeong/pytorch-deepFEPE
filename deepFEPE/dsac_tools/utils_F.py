@@ -296,12 +296,12 @@ def _sampson_dist(F, X, Y, if_homo=False):
         nominator = (torch.diag(Y@F@X.t()))**2
         Fx1 = torch.mm(F, X.t())
         Fx2 = torch.mm(F.t(), Y.t())
-        denom = Fx1[0]**2 + Fx1[1]**2 + Fx2[0]**2 + Fx2[1]**2
+        denom = Fx1[0]**2 + Fx1[1]**2 + Fx2[0]**2 + Fx2[1]**2 + 1e-10
     else:
         nominator = (torch.diagonal(Y@F@X.transpose(1, 2), dim1=1, dim2=2))**2
         Fx1 = torch.matmul(F, X.transpose(1, 2))
         Fx2 = torch.matmul(F.transpose(1, 2), Y.transpose(1, 2))
-        denom = Fx1[:, 0]**2 + Fx1[:, 1]**2 + Fx2[:, 0]**2 + Fx2[:, 1]**2
+        denom = Fx1[:, 0]**2 + Fx1[:, 1]**2 + Fx2[:, 0]**2 + Fx2[:, 1]**2 + 1e-10
         # print(nominator.size(), denom.size())
 
     errors = nominator/denom
@@ -347,14 +347,14 @@ def _epi_distance(F, X, Y, if_homo=False):
         nominator = torch.diag(Y@F@X.t()).abs()
         Fx1 = torch.mm(F, X.t())
         Fx2 = torch.mm(F.t(), Y.t())
-        denom_recp_Y_to_FX = 1./torch.sqrt(Fx1[0]**2 + Fx1[1]**2)
-        denom_recp_X_to_FY = 1./torch.sqrt(Fx2[0]**2 + Fx2[1]**2)
+        denom_recp_Y_to_FX = 1./torch.sqrt(Fx1[0]**2 + Fx1[1]**2 + 1e-10)
+        denom_recp_X_to_FY = 1./torch.sqrt(Fx2[0]**2 + Fx2[1]**2 + 1e-10)
     else:
         nominator = (torch.diagonal(Y@F@X.transpose(1, 2), dim1=1, dim2=2)).abs()
         Fx1 = torch.matmul(F, X.transpose(1, 2))
         Fx2 = torch.matmul(F.transpose(1, 2), Y.transpose(1, 2))
-        denom_recp_Y_to_FX = 1./torch.sqrt(Fx1[:, 0]**2 + Fx1[:, 1]**2)
-        denom_recp_X_to_FY = 1./torch.sqrt(Fx2[:, 0]**2 + Fx2[:, 1]**2)
+        denom_recp_Y_to_FX = 1./torch.sqrt(Fx1[:, 0]**2 + Fx1[:, 1]**2 + 1e-10)
+        denom_recp_X_to_FY = 1./torch.sqrt(Fx2[:, 0]**2 + Fx2[:, 1]**2 + 1e-10)
         # print(nominator.size(), denom.size())
     dist1 = nominator*denom_recp_Y_to_FX
     dist2 = nominator*denom_recp_X_to_FY
@@ -369,14 +369,14 @@ def epi_distance_np(F, X, Y, if_homo=False):
         nominator = np.abs(np.diag(Y@F@X.T))
         Fx1 = F @ X.T
         Fx2 = F.T @ Y.T
-        denom_recp_Y_to_FX = 1./np.sqrt(Fx1[0]**2 + Fx1[1]**2)
-        denom_recp_X_to_FY = 1./np.sqrt(Fx2[0]**2 + Fx2[1]**2)
+        denom_recp_Y_to_FX = 1./np.sqrt(Fx1[0]**2 + Fx1[1]**2 + 1e-10)
+        denom_recp_X_to_FY = 1./np.sqrt(Fx2[0]**2 + Fx2[1]**2 + 1e-10)
     else:
         nominator = np.abs(np.diagonal(np.transpose(Y@F@X, (1, 2)), axis=1, axis2=2))
         Fx1 = F @np.transpose(X, (1, 2))
         Fx2 = np.transpose(F, (1, 2)) @ np.transpose(Y, (1, 2))
-        denom_recp_Y_to_FX = 1./np.sqrt(Fx1[:, 0]**2 + Fx1[:, 1]**2)
-        denom_recp_X_to_FY = 1./np.sqrt(Fx2[:, 0]**2 + Fx2[:, 1]**2)
+        denom_recp_Y_to_FX = 1./np.sqrt(Fx1[:, 0]**2 + Fx1[:, 1]**2 + 1e-10)
+        denom_recp_X_to_FY = 1./np.sqrt(Fx2[:, 0]**2 + Fx2[:, 1]**2 + 1e-10)
         # print(nominator.size(), denom.size())
     dist1 = nominator * denom_recp_Y_to_FX
     dist2 = nominator * denom_recp_X_to_FY
@@ -473,6 +473,13 @@ def E_to_F_np(E, K):
         F = np.linalg.inv(K).T @ E @ np.linalg.inv(K)
     else:
         np.transpose(np.linalg.inv(K), (1, 2)) @ E @ np.linalg.inv(K)
+    return F
+
+def E_to_F_np_notsym(E, K1, K2):
+    if len(E.shape)==2:
+        F = np.linalg.inv(K2).T @ E @ np.linalg.inv(K1)
+    else:
+        np.transpose(np.linalg.inv(K2), (1, 2)) @ E @ np.linalg.inv(K1)
     return F
 
 def _get_M2s(E):
@@ -934,6 +941,59 @@ def goodCorr_eval_nondecompose(p1s, p2s, E_hat, delta_Rtij_inv, K, scores, if_my
                 print(Rt_cam[0], Rt_cam[1])
         else:
             num_inlier, R, t, mask_new = cv2.recoverPose(E_hat, p1s_good, p2s_good, focal=K[0, 0], pp=(K[0, 2], K[1, 2]))
+        try:
+            R_cam, t_cam = utils_geo.invert_Rt(R, t)
+            err_q = utils_geo.rot12_to_angle_error(R_cam, delta_Rtij_inv[:3, :3])
+            err_t = utils_geo.vector_angle(t_cam, delta_Rtij_inv[:3, 3:4])
+            # err_q, err_t = evaluate_R_t(dR, dt, R, t) # (3, 3) (3,) (3, 3) (3, 1)
+        except:
+            print("Failed in evaluation")
+            print(R)
+            print(t)
+            err_q = 180.
+            err_t = 90.
+    else:
+        err_q = 180.
+        err_t = 90.
+        R = np.eye(3).astype(np.float32)
+        t = np.zeros((3, 1), np.float32)
+
+    return np.hstack((R, t)), (err_q, err_t)
+
+def goodCorr_eval_nondecompose_notsym(p1s, p2s, E_hat, delta_Rtij_inv, K1, K2, scores, if_my_decomp=False):
+    # Use only the top 10% in terms of score to decompose, we can probably
+    # implement a better way of doing this, but this should be just fine.
+    if scores is not None:
+        num_top = len(scores) // 10
+        num_top = max(1, num_top)
+        th = np.sort(scores)[::-1][num_top] ## [RUI] Only evaluating the top 10% corres.
+        mask = scores >= th
+
+        p1s_good = p1s[mask]
+        p2s_good = p2s[mask]
+    else:
+        p1s_good, p2s_good = p1s, p2s
+
+    # Match types
+    # E_hat = E_hat.reshape(3, 3).astype(p1s.dtype))
+    if p1s_good.shape[0] >= 5:
+        # Get the best E just in case we get multipl E from findEssentialMat
+        # num_inlier, R, t, mask_new = cv2.recoverPose(
+        #     E_hat, p1s_good, p2s_good)
+        if if_my_decomp:
+            M2_list, error_Rt, Rt_cam = _E_to_M(torch.from_numpy(E_hat), torch.from_numpy(p1s_good), torch.from_numpy(p2s_good), delta_Rt_gt=delta_Rtij_inv, show_debug=False, method_name='Ours_best%d'%best_N)
+            if not Rt_cam:
+                return None, None
+            else:
+                print(Rt_cam[0], Rt_cam[1])
+        else:
+            # num_inlier, R, t, mask_new = cv2.recoverPose(E_hat, p1s_good, p2s_good, focal=K[0, 0], pp=(K[0, 2], K[1, 2]))
+            p1s_good_norm = cv2.undistortPoints(np.expand_dims(p1s_good, axis=1), cameraMatrix=K1, distCoeffs=None)[:,0,:]
+            p2s_good_norm = cv2.undistortPoints(np.expand_dims(p2s_good, axis=1), cameraMatrix=K2, distCoeffs=None)[:,0,:]
+            if scores is not None:
+                num_inlier, R, t, mask_new = cv2.recoverPose(E_hat, p1s_good_norm, p2s_good_norm, mask=mask)
+            else:
+                num_inlier, R, t, mask_new = cv2.recoverPose(E_hat, p1s_good_norm, p2s_good_norm)
         try:
             R_cam, t_cam = utils_geo.invert_Rt(R, t)
             err_q = utils_geo.rot12_to_angle_error(R_cam, delta_Rtij_inv[:3, :3])
